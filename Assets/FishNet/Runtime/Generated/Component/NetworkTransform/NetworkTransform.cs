@@ -668,6 +668,20 @@ namespace FishNet.Component.Transforming
         /// </summary>
         private bool _teleport;
         /// <summary>
+        /// Shroomies: how many more packets carry the teleport flag after Teleport() was called.
+        /// A single unreliable packet with the flag may be lost, or dropped as old when the following
+        /// reliable "settled" packet overtakes it; spectators would then smooth across the whole teleport.
+        /// </summary>
+        private byte _teleportPacketsRemaining;
+        /// <summary>
+        /// Shroomies: the teleport flag went out unreliably since the last reliable packet, so the next reliable repeats it.
+        /// </summary>
+        private bool _teleportSinceReliable;
+        /// <summary>
+        /// Shroomies: packets carrying the teleport flag: the first one plus repeats.
+        /// </summary>
+        private const byte TELEPORT_FLAG_PACKETS = 3;
+        /// <summary>
         /// Cached transform
         /// </summary>
         private Transform _cachedTransform;
@@ -1084,8 +1098,45 @@ namespace FishNet.Component.Transforming
         /// </summary>
         public void Teleport()
         {
+            // Shroomies: the flag is repeated over several packets, see PrepareTeleportFlag.
             if (CanControl())
+                _teleportPacketsRemaining = TELEPORT_FLAG_PACKETS;
+        }
+
+        /// <summary>
+        /// Shroomies: decides if the packet about to be serialized carries the teleport flag.
+        /// Repeated flags are harmless: spectators snap to a goal which is one tick away from the previous.
+        /// A reliable packet ends the repeats; it carries the flag if an unreliable one did since the last reliable.
+        /// </summary>
+        private void PrepareTeleportFlag(Channel channel)
+        {
+            if (_teleportPacketsRemaining > 0)
+            {
                 _teleport = true;
+                _teleportPacketsRemaining--;
+            }
+
+            if (channel == Channel.Reliable)
+            {
+                if (_teleportSinceReliable)
+                    _teleport = true;
+                _teleportSinceReliable = false;
+                _teleportPacketsRemaining = 0;
+            }
+            else if (_teleport)
+            {
+                _teleportSinceReliable = true;
+            }
+        }
+
+        /// <summary>
+        /// Shroomies: forgets a pending teleport.
+        /// </summary>
+        private void ResetTeleportFlag()
+        {
+            _teleport = false;
+            _teleportPacketsRemaining = 0;
+            _teleportSinceReliable = false;
         }
 
         /// <summary>
@@ -1202,7 +1253,8 @@ namespace FishNet.Component.Transforming
                 }
             }
 
-            _teleport = false;
+            // Shroomies: also forget repeated teleport flags.
+            ResetTeleportFlag();
             SetLastReceived(_lastReceivedServerTransformData);
             SetLastReceived(_lastReceivedClientTransformData);
             //SetInstantRates(_currentGoalData.Rates, 0, -1f);
@@ -1857,13 +1909,21 @@ namespace FishNet.Component.Transforming
                     {
                         //No changes since last reliable; transform is up to date.
                         if (_serverChangedSinceReliable == ChangedDelta.Unset)
+                        {
+                            // Shroomies: a teleport which moved nothing must not mark later movement as a teleport.
+                            _teleportPacketsRemaining = 0;
                             return;
+                        }
 
                         _serverChangedSinceReliable = ChangedDelta.Unset;
                         writer = _toClientChangedWriter;
                         /* If here then current is unset but last was not.
                          * Send last as reliable so clients have the latest sent through. */
                         channel = Channel.Reliable;
+                        /* Shroomies: the reliable is a copy of the last packet, so it already carries the teleport
+                         * flag if that one did. End the repeats so later movement is not sent as a teleport. */
+                        _teleportPacketsRemaining = 0;
+                        _teleportSinceReliable = false;
                     }
                     //There is change.
                     else
@@ -1881,6 +1941,8 @@ namespace FishNet.Component.Transforming
                         //lastSentData.Update(0, t.localPosition, t.localRotation, t.localScale, t.localPosition, ParentBehaviour);
                         lastSentData.Tick = 0;
 
+                        // Shroomies.
+                        PrepareTeleportFlag(channel);
                         SerializeChanged(changed, writer, lastSentData);
                     }
 
@@ -1918,7 +1980,11 @@ namespace FishNet.Component.Transforming
                 {
                     //No changes since last reliable; transform is up to date.
                     if (_clientChangedSinceReliable == ChangedDelta.Unset)
+                    {
+                        // Shroomies: a teleport which moved nothing must not mark later movement as a teleport.
+                        _teleportPacketsRemaining = 0;
                         return;
+                    }
 
                     //Set changed to all changes over time and unset changes over time.
                     changed = _clientChangedSinceReliable;
@@ -1940,6 +2006,8 @@ namespace FishNet.Component.Transforming
 
                 //Send latest.
                 PooledWriter writer = WriterPool.Retrieve();
+                // Shroomies.
+                PrepareTeleportFlag(channel);
                 SerializeChanged(changed, writer, lastSentTransformData);
 
                 ServerUpdateTransform(writer.GetArraySegment(), channel);
@@ -2679,7 +2747,8 @@ namespace FishNet.Component.Transforming
         /// </summary>
         private void ResetState()
         {
-            _teleport = false;
+            // Shroomies: also forget repeated teleport flags.
+            ResetTeleportFlag();
             ChangeTickSubscription(false);
             /* Reset server and client side since this is called from
              * OnStopNetwork. */
