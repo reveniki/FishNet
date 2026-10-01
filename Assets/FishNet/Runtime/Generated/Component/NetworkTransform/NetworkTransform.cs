@@ -52,12 +52,16 @@ namespace FishNet.Component.Transforming
             /// LocalTick of the side receiving this update, typically the server.
             /// </summary>
             public uint LocalTick;
+            /// <summary>
+            /// Shroomies: tick of the owning client when it sent this data.
+            /// </summary>
+            public uint OwnerTick;
 
             /// <summary>
             /// Updates current values.
             /// </summary>
             /// <param name = "updateHasData">True to set all HasData to true.</param>
-            public void Update(ArraySegment<byte> data, Channel channel, bool updateHasData, uint localTick)
+            public void Update(ArraySegment<byte> data, Channel channel, bool updateHasData, uint localTick, uint ownerTick)
             {
                 if (Writer == null)
                     Writer = WriterPool.Retrieve();
@@ -66,6 +70,7 @@ namespace FishNet.Component.Transforming
                 Writer.WriteArraySegment(data);
                 Channel = channel;
                 LocalTick = localTick;
+                OwnerTick = ownerTick;
 
                 if (updateHasData)
                     HasData = true;
@@ -85,6 +90,16 @@ namespace FishNet.Component.Transforming
                 HasData = false;
                 WriterPool.StoreAndDefault(ref Writer);
             }
+        }
+
+        /// <summary>
+        /// Shroomies: a packet from the owning client waiting to be relayed to observers.
+        /// </summary>
+        private struct PendingRelay
+        {
+            public PooledWriter Writer;
+            public Channel Channel;
+            public uint OwnerTick;
         }
 
         [Serializable]
@@ -574,6 +589,21 @@ namespace FishNet.Component.Transforming
         /// </summary>
         private ReceivedClientData _authoritativeClientData = new();
         /// <summary>
+        /// Shroomies: every packet received from the owning client since the last relay, in arrival order.
+        /// Several packets can arrive within one server tick (the server reads incoming data once per frame,
+        /// a client sends once per tick); relaying only the latest drops movement and stamps it with the
+        /// server tick, which makes observers compute wrong speeds.
+        /// </summary>
+        private readonly List<PendingRelay> _pendingRelays = new();
+        /// <summary>
+        /// Shroomies: maximum relays kept between sends; the oldest is dropped beyond this.
+        /// </summary>
+        private const int MAXIMUM_PENDING_RELAYS = 64;
+        /// <summary>
+        /// Shroomies: owner tick of the last relayed packet accepted by this observer.
+        /// </summary>
+        private uint _lastRelayedOwnerTick;
+        /// <summary>
         /// True if subscribed to TimeManager for ticks.
         /// </summary>
         private bool _subscribedToTicks;
@@ -722,6 +752,9 @@ namespace FishNet.Component.Transforming
             _intervalsRemaining = 0;
             // Reset last tick since each client sends their own ticks.
             _lastServerRpcTick = 0;
+            // Shroomies: data of the previous owner must not be relayed under the new owner.
+            ClearPendingRelays();
+            _authoritativeClientData.ResetState();
 
             TryClearGoalDatas_OwnershipChange(prevOwner, true);
         }
@@ -730,6 +763,8 @@ namespace FishNet.Component.Transforming
         {
             ConfigureComponents();
             _intervalsRemaining = 0;
+            // Shroomies: each owner has its own tick sequence.
+            _lastRelayedOwnerTick = TimeManager.UNSET_TICK;
 
             // Not new owner.
             if (!IsOwner)
@@ -1759,11 +1794,34 @@ namespace FishNet.Component.Transforming
                  * If owner is clientHost just send current server values. */
                 if (clientAuthoritativeWithOwner && !Owner.IsLocalClient)
                 {
+                    /* Shroomies: relay every packet received from the owner since the last send,
+                     * each with the owner's tick, rather than only the latest one. */
+                    if (_pendingRelays.Count > 0)
+                    {
+                        _changedSinceStart = true;
+                        int ownerId = Owner.ClientId;
+                        Channel lastRelayedChannel = Channel.Unreliable;
+                        foreach (PendingRelay relay in _pendingRelays)
+                        {
+                            ObserversRelayClientAuthoritativeTransform(ownerId, relay.OwnerTick, relay.Writer.GetArraySegment(), relay.Channel);
+                            lastRelayedChannel = relay.Channel;
+                        }
+
+                        ClearPendingRelays();
+                        /* Reliable flag still set while the latest went out unreliably means ForceSend was called:
+                         * fall through to resend the latest reliably. Otherwise everything is sent. */
+                        bool forceSendPending = _authoritativeClientData.HasData && _authoritativeClientData.Channel == Channel.Reliable && lastRelayedChannel != Channel.Reliable;
+                        if (!forceSendPending)
+                        {
+                            _authoritativeClientData.HasData = false;
+                            return;
+                        }
+                    }
                     /* If there is not new data yet and the last received was not reliable
                      * then a packet maybe did not arrive when expected. See if we need
                      * to force a reliable with the last data based on ticks passed since
                      * last update.*/
-                    if (!_authoritativeClientData.HasData && _authoritativeClientData.Channel != Channel.Reliable && _authoritativeClientData.Writer != null)
+                    else if (!_authoritativeClientData.HasData && _authoritativeClientData.Channel != Channel.Reliable && _authoritativeClientData.Writer != null)
                     {
                         /* If ticks have passed beyond interpolation then force
                          * to send reliably. */
@@ -1780,7 +1838,8 @@ namespace FishNet.Component.Transforming
                     {
                         _changedSinceStart = true;
                         //Resend data from clients.
-                        ObserversUpdateClientAuthoritativeTransform(_authoritativeClientData.Writer.GetArraySegment(), _authoritativeClientData.Channel);
+                        // Shroomies: relay with the owner's tick.
+                        ObserversRelayClientAuthoritativeTransform(Owner.ClientId, _authoritativeClientData.OwnerTick, _authoritativeClientData.Writer.GetArraySegment(), _authoritativeClientData.Channel);
                         //Now being sent data can unset.
                         _authoritativeClientData.HasData = false;
                     }
@@ -1972,6 +2031,13 @@ namespace FishNet.Component.Transforming
                     changed |= ChangedDelta.PositionY;
                 if (Mathf.Abs(position.z - lastPosition.z) >= _positionSensitivity)
                     changed |= ChangedDelta.PositionZ;
+
+                /* Shroomies: if any axis changed send all three. Packets carry only changed axes, so a lost
+                 * unreliable packet could leave an axis stale on receivers (e.g. height after landing) until
+                 * the transform fully stops. Costs a few bytes per packet. */
+                const ChangedDelta allPositionAxes = ChangedDelta.PositionX | ChangedDelta.PositionY | ChangedDelta.PositionZ;
+                if ((changed & allPositionAxes) != ChangedDelta.Unset)
+                    changed |= allPositionAxes;
             }
 
             if (_synchronizeRotation)
@@ -2309,6 +2375,52 @@ namespace FishNet.Component.Transforming
         }
 
         /// <summary>
+        /// Shroomies: relays data of an authoritative client to observers with the owner's tick.
+        /// Several relays may share one server packet, so newness is judged by the owner tick, not the packet tick.
+        /// </summary>
+        [ObserversRpc(ExcludeOwner = true, ExcludeServer = true)]
+        private void ObserversRelayClientAuthoritativeTransform(int ownerId, uint ownerTick, ArraySegment<byte> data, Channel channel)
+        {
+            if (IsOwner || IsServerInitialized)
+                return;
+            // Sent for a previous owner and arrived after the ownership change.
+            if (ownerId != Owner.ClientId)
+                return;
+            // Old or duplicate data. A reliable resend of the latest data carries the same tick and is accepted.
+            if (ownerTick < _lastRelayedOwnerTick || (ownerTick == _lastRelayedOwnerTick && channel != Channel.Reliable))
+                return;
+
+            _lastRelayedOwnerTick = ownerTick;
+            DataReceived(data, channel, false, ownerTick);
+        }
+
+        /// <summary>
+        /// Shroomies: queues a packet from the owning client to relay on the next send.
+        /// </summary>
+        private void AddPendingRelay(ArraySegment<byte> data, Channel channel, uint ownerTick)
+        {
+            if (_pendingRelays.Count >= MAXIMUM_PENDING_RELAYS)
+            {
+                WriterPool.Store(_pendingRelays[0].Writer);
+                _pendingRelays.RemoveAt(0);
+            }
+
+            PooledWriter writer = WriterPool.Retrieve();
+            writer.WriteArraySegment(data);
+            _pendingRelays.Add(new PendingRelay { Writer = writer, Channel = channel, OwnerTick = ownerTick });
+        }
+
+        /// <summary>
+        /// Shroomies: clears queued relays and returns their writers to the pool.
+        /// </summary>
+        private void ClearPendingRelays()
+        {
+            foreach (PendingRelay relay in _pendingRelays)
+                WriterPool.Store(relay.Writer);
+            _pendingRelays.Clear();
+        }
+
+        /// <summary>
         /// Updates the transform on the server.
         /// </summary>
         [ServerRpc]
@@ -2327,14 +2439,17 @@ namespace FishNet.Component.Transforming
                 return;
             _lastServerRpcTick = lastPacketTick;
 
-            _authoritativeClientData.Update(data, channel, updateHasData: true, tm.LocalTick);
+            _authoritativeClientData.Update(data, channel, updateHasData: true, tm.LocalTick, lastPacketTick);
+            // Shroomies: keep every packet for relaying, not only the latest.
+            AddPendingRelay(data, channel, lastPacketTick);
             DataReceived(data, channel, true);
         }
 
         /// <summary>
         /// Processes received data for lcients and server.
         /// </summary>
-        private void DataReceived(ArraySegment<byte> data, Channel channel, bool asServer)
+        /// <param name = "ownerTick">Shroomies: tick of the owning client for relayed data; null to use the tick of the received packet.</param>
+        private void DataReceived(ArraySegment<byte> data, Channel channel, bool asServer, uint? ownerTick = null)
         {
             if (IsDeinitializing)
                 return;
@@ -2345,7 +2460,7 @@ namespace FishNet.Component.Transforming
             ChangedFull changedFull = ChangedFull.Unset;
             GoalData nextGd = ResettableObjectCaches<GoalData>.Retrieve();
             TransformData nextTd = nextGd.Transforms;
-            UpdateTransformData(data, prevTd, nextTd, ref changedFull);
+            UpdateTransformData(data, prevTd, nextTd, ref changedFull, ownerTick);
 
             OnDataReceived?.Invoke(prevTd, nextTd);
             SetExtrapolatedData(prevTd, nextTd, channel);
@@ -2452,12 +2567,13 @@ namespace FishNet.Component.Transforming
         /// <summary>
         /// Updates a TransformData from packetData.
         /// </summary>
-        private void UpdateTransformData(ArraySegment<byte> packetData, TransformData prevTransformData, TransformData nextTransformData, ref ChangedFull changedFull)
+        private void UpdateTransformData(ArraySegment<byte> packetData, TransformData prevTransformData, TransformData nextTransformData, ref ChangedFull changedFull, uint? ownerTick)
         {
             using (_pm_UpdateTransformData.Auto())
             {
                 DeserializePacket(packetData, prevTransformData, nextTransformData, ref changedFull);
-                nextTransformData.Tick = _timeManager.LastPacketTick.LastRemoteTick;
+                // Shroomies: relayed data is timed by the owner's ticks; the server packet tick says nothing about when the owner moved.
+                nextTransformData.Tick = ownerTick ?? _timeManager.LastPacketTick.LastRemoteTick;
             }
         }
 
@@ -2570,6 +2686,9 @@ namespace FishNet.Component.Transforming
 
             _lastObserversRpcTick = TimeManager.UNSET_TICK;
             _authoritativeClientData.ResetState();
+            // Shroomies.
+            ClearPendingRelays();
+            _lastRelayedOwnerTick = TimeManager.UNSET_TICK;
 
             WriterPool.StoreAndDefault(ref _toClientChangedWriter);
 
