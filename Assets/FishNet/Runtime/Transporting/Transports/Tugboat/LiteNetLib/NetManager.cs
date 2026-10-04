@@ -180,6 +180,12 @@ namespace LiteNetLib
         /// </summary>
         public bool SimulatePacketLoss = false;
         /// <summary>
+        /// Shroomies: debug blackout. While true every packet in and out is silently dropped, as if the network cable
+        /// were pulled: no disconnect message, the other side only notices the silence. Used by the game's debug tools
+        /// to test reconnection; never set during normal play.
+        /// </summary>
+        public volatile bool ShroomiesBlackout;
+        /// <summary>
         /// Simulate latency by holding packets for random time. (Works only in DEBUG mode)
         /// </summary>
         public bool SimulateLatency = false;
@@ -752,7 +758,8 @@ namespace LiteNetLib
 
         private void OnMessageReceived(NetPacket packet, IPEndPoint remoteEndPoint)
         {
-            if (packet.Size == 0)
+            //Shroomies: debug blackout drops everything that arrives.
+            if (packet.Size == 0 || ShroomiesBlackout)
             {
                 PoolRecycle(packet);
                 return;

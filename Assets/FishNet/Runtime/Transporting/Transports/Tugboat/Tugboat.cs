@@ -345,6 +345,24 @@ namespace FishNet.Transporting.Tugboat
         /// Sets how long in seconds until either the server or client socket must go without data before being timed out.
         /// </summary>
         /// <param name = "asServer">True to set the timeout for the server socket, false for the client socket.</param>
+        /// <summary>
+        /// Shroomies: debug blackout — while on, the server (asServer) or client socket silently drops every packet in
+        /// and out, like a pulled network cable: no disconnect message, the other side only notices the silence and times
+        /// out. For testing reconnection only.
+        /// </summary>
+        public void SetBlackout(bool value, bool asServer)
+        {
+            if (asServer)
+                ServerSocket.SetBlackout(value);
+            else
+                ClientSocket.SetBlackout(value);
+        }
+
+        /// <summary>
+        /// Shroomies: true while the debug blackout is on for the server (asServer) or client socket.
+        /// </summary>
+        public bool GetBlackout(bool asServer) => asServer ? ServerSocket.Blackout : ClientSocket.Blackout;
+
         public override void SetTimeout(float value, bool asServer)
         {
             int timeoutValue = (int)Math.Ceiling(value);

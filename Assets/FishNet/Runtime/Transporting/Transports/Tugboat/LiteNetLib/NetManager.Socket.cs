@@ -507,6 +507,9 @@ namespace LiteNetLib
         {
             if (!IsRunning)
                 return 0;
+            //Shroomies: debug blackout — pretend the packet was sent and lose it on the way.
+            if (ShroomiesBlackout)
+                return length;
 
             NetPacket expandedPacket = null;
             if (_extraPacketLayer != null)

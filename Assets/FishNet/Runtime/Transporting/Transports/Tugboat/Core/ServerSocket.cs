@@ -129,6 +129,8 @@ namespace FishNet.Transporting.Tugboat.Server
             NetManager.DontRoute = ((Tugboat)Transport).DontRoute;
             NetManager.ReuseAddress = ((Tugboat)Transport).ReuseAddress;
             NetManager.MtuOverride = _mtu;// + NetConstants.FragmentedHeaderTotalSize;
+            //Shroomies: a debug blackout outlives restarts.
+            NetManager.ShroomiesBlackout = Blackout;
             
             UpdateTimeout(_timeout);
 

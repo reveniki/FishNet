@@ -91,6 +91,8 @@ namespace FishNet.Transporting.Tugboat.Client
             NetManager = new(listener, _packetLayer, false);
             NetManager.DontRoute = ((Tugboat)Transport).DontRoute;
             NetManager.MtuOverride = _mtu;// + NetConstants.FragmentedHeaderTotalSize;
+            //Shroomies: a debug blackout outlives reconnects.
+            NetManager.ShroomiesBlackout = Blackout;
 
             UpdateTimeout(_timeout);
 

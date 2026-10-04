@@ -47,6 +47,20 @@ namespace FishNet.Transporting.Tugboat
         /// NetManager for this socket.
         /// </summary>
         internal NetManager NetManager;
+        /// <summary>
+        /// Shroomies: debug blackout for this socket; kept here because NetManager is created anew on every start.
+        /// </summary>
+        internal bool Blackout;
+
+        /// <summary>
+        /// Shroomies: turns the debug blackout on or off for this socket (see NetManager.ShroomiesBlackout).
+        /// </summary>
+        internal void SetBlackout(bool value)
+        {
+            Blackout = value;
+            if (NetManager != null)
+                NetManager.ShroomiesBlackout = value;
+        }
         #endregion
 
         #region Protected.
